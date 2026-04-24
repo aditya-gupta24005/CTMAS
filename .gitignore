@@ -1,0 +1,59 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtual environments ────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Jupyter / IPython ───────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Data (large files — keep locally or on Drive) ──────
+Data/merged.csv
+Data/processed/
+*.npy
+*.pkl
+!Data/processed/.gitkeep
+
+# ── Trained models / checkpoints ───────────────────────
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ── Logs / runtime artifacts ───────────────────────────
+*.log
+runs/
+wandb/
+mlruns/
+outputs/
+
+# ── macOS ──────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDE / editor ───────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Claude / AI tooling ────────────────────────────────
+.claude/
+
+# ── Misc ───────────────────────────────────────────────
+.env
+.env.local
+*.tmp

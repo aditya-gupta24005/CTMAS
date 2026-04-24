@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CTMAS — Cyber-Physical Threat Monitor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/recharts@2.10.3/umd/Recharts.js"></script>
+  <style>
+    body { background: #0a0e1a; color: #e2e8f0; font-family: 'Courier New', monospace; }
+    .glow-red    { box-shadow: 0 0 12px rgba(239,68,68,0.6); }
+    .glow-orange { box-shadow: 0 0 12px rgba(249,115,22,0.6); }
+    .glow-yellow { box-shadow: 0 0 12px rgba(234,179,8,0.5); }
+    .glow-green  { box-shadow: 0 0 8px rgba(34,197,94,0.4); }
+    @keyframes pulse-ring { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .pulse { animation: pulse-ring 1.5s ease-in-out infinite; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+    const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine } = Recharts;
+
+    const STAGES = ["P1","P2","P3","P4","P5","P6"];
+    const STAGE_LABELS = {
+      P1: "Raw Intake", P2: "Chem Dosing", P3: "Filtration",
+      P4: "UV Dechlorin.", P5: "RO Membrane", P6: "Output"
+    };
+    const EDGES = [[0,1],[1,2],[2,3],[3,4],[4,5],[2,0],[4,0]];
+    const NODE_POS = [
+      {x:80,y:200},{x:220,y:200},{x:360,y:200},
+      {x:500,y:200},{x:640,y:200},{x:780,y:200}
+    ];
+
+    function severityColor(sev) {
+      if (sev >= 3) return "#ef4444";
+      if (sev === 2) return "#f97316";
+      if (sev === 1) return "#eab308";
+      return "#22c55e";
+    }
+    function severityGlow(sev) {
+      if (sev >= 3) return "glow-red";
+      if (sev === 2) return "glow-orange";
+      if (sev === 1) return "glow-yellow";
+      return "glow-green";
+    }
+    function stateColor(state) {
+      const m = {NORMAL:"#22c55e", RECON:"#eab308", INTRUSION:"#f97316", IMPACT:"#ef4444"};
+      return m[state] || "#64748b";
+    }
+
+    // ── Plant topology SVG ───────────────────────────────────────────────────
+    function PlantGraph({ nodeErrors, nodeAnomaly, threshold }) {
+      return (
+        <svg viewBox="0 0 860 300" className="w-full" style={{background:"#0f172a",borderRadius:8}}>
+          {/* edges */}
+          {EDGES.map(([a,b],i) => (
+            <line key={i}
+              x1={NODE_POS[a].x} y1={NODE_POS[a].y}
+              x2={NODE_POS[b].x} y2={NODE_POS[b].y}
+              stroke="#334155" strokeWidth="2" strokeDasharray="4 3"
+              markerEnd="url(#arrow)"
+            />
+          ))}
+          <defs>
+            <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L6,3 z" fill="#334155"/>
+            </marker>
+          </defs>
+          {/* nodes */}
+          {STAGES.map((s,i) => {
+            const pos = NODE_POS[i];
+            const err = nodeErrors ? nodeErrors[i] : 0;
+            const anom = nodeAnomaly ? nodeAnomaly[i] : false;
+            const col = anom ? "#ef4444" : (err > (threshold * 0.7) ? "#eab308" : "#22c55e");
+            const r = 36;
+            return (
+              <g key={s}>
+                {anom && (
+                  <circle cx={pos.x} cy={pos.y} r={r+8} fill="none"
+                    stroke="#ef4444" strokeWidth="2" opacity="0.5" className="pulse"/>
+                )}
+                <circle cx={pos.x} cy={pos.y} r={r} fill="#1e293b" stroke={col} strokeWidth="2.5"/>
+                <text x={pos.x} y={pos.y-8} textAnchor="middle" fill={col}
+                  fontSize="14" fontWeight="bold">{s}</text>
+                <text x={pos.x} y={pos.y+8} textAnchor="middle" fill="#94a3b8" fontSize="9">
+                  {STAGE_LABELS[s]}
+                </text>
+                <text x={pos.x} y={pos.y+22} textAnchor="middle" fill={col} fontSize="9">
+                  {err ? err.toFixed(5) : "—"}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      );
+    }
+
+    // ── EWMA Sparkline ───────────────────────────────────────────────────────
+    function EwmaChart({ history, threshold }) {
+      const data = history.slice(-120).map((v,i) => ({i, v}));
+      return (
+        <ResponsiveContainer width="100%" height={140}>
+          <LineChart data={data} margin={{top:4,right:8,bottom:4,left:0}}>
+            <CartesianGrid strokeDasharray="2 4" stroke="#1e293b"/>
+            <XAxis dataKey="i" hide/>
+            <YAxis domain={['auto','auto']} tick={{fill:"#64748b",fontSize:9}}/>
+            <Tooltip
+              contentStyle={{background:"#1e293b",border:"1px solid #334155",fontSize:10}}
+              formatter={v => [v.toFixed(6),"EWMA"]}
+            />
+            {threshold && (
+              <ReferenceLine y={threshold} stroke="#ef4444" strokeDasharray="3 3" label={{value:"threshold",fill:"#ef4444",fontSize:9}}/>
+            )}
+            <Line type="monotone" dataKey="v" dot={false} stroke="#38bdf8" strokeWidth={1.5}/>
+          </LineChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    // ── Per-node error bars ──────────────────────────────────────────────────
+    function NodeErrorBars({ nodeErrors, nodeThreshold }) {
+      if (!nodeErrors) return null;
+      const max = Math.max(...nodeErrors, ...(nodeThreshold||[0]), 0.001);
+      return (
+        <div className="grid grid-cols-6 gap-1">
+          {STAGES.map((s,i) => {
+            const err = nodeErrors[i] || 0;
+            const thr = nodeThreshold ? nodeThreshold[i] : null;
+            const pct = Math.min(100, (err/max)*100);
+            const thrPct = thr ? Math.min(100, (thr/max)*100) : null;
+            const col = err > (thr||Infinity) ? "#ef4444" : err > (thr||Infinity)*0.7 ? "#eab308" : "#22c55e";
+            return (
+              <div key={s} className="flex flex-col items-center gap-1">
+                <div className="text-xs text-slate-400">{s}</div>
+                <div className="relative w-full h-20 bg-slate-800 rounded" style={{minWidth:32}}>
+                  <div className="absolute bottom-0 w-full rounded transition-all duration-300"
+                    style={{height:`${pct}%`, background:col, opacity:0.8}}/>
+                  {thrPct !== null && (
+                    <div className="absolute w-full" style={{bottom:`${thrPct}%`,borderTop:"1px dashed #ef4444"}}/>
+                  )}
+                </div>
+                <div className="text-xs" style={{color:col}}>{err.toFixed(4)}</div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ── FSM State Machine display ────────────────────────────────────────────
+    function AttackStateBar({ state, stage, impactProb, minutesToImpact }) {
+      const states = ["NORMAL","RECON","INTRUSION","IMPACT"];
+      return (
+        <div>
+          <div className="flex gap-1 mb-2">
+            {states.map((s,i) => {
+              const active = s === state;
+              const past = i < states.indexOf(state);
+              const col = stateColor(s);
+              return (
+                <div key={s} className="flex-1 text-center py-1.5 rounded text-xs font-bold transition-all duration-500"
+                  style={{
+                    background: active ? col : past ? col+"33" : "#1e293b",
+                    color: active ? "#0a0e1a" : past ? col : "#475569",
+                    border: `1px solid ${active ? col : "#334155"}`,
+                    transform: active ? "scale(1.05)" : "scale(1)"
+                  }}>
+                  {s}
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex gap-4 text-xs text-slate-400">
+            <span>Stage <span className="text-white font-bold">{stage}/3</span></span>
+            <span>Impact prob: <span style={{color: stateColor(state)}} className="font-bold">{(impactProb*100).toFixed(0)}%</span></span>
+            {minutesToImpact !== null && minutesToImpact !== undefined && (
+              <span>ETA: <span className="text-orange-400 font-bold">{minutesToImpact?.toFixed(1)}min</span></span>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── MITRE Techniques ────────────────────────────────────────────────────
+    function MitreTechniques({ techniques }) {
+      if (!techniques || techniques.length === 0)
+        return <div className="text-slate-600 text-xs italic">No active techniques</div>;
+      return (
+        <div className="flex flex-col gap-1.5">
+          {techniques.map(t => (
+            <div key={t.id} className="bg-slate-800 rounded p-2 border border-slate-700">
+              <div className="flex gap-2 items-center">
+                <span className="text-xs font-bold text-orange-400 font-mono">{t.id}</span>
+                <span className="text-xs text-white">{t.name}</span>
+                <span className="ml-auto text-xs text-slate-500">{t.tactic}</span>
+              </div>
+              <div className="text-xs text-slate-400 mt-0.5 leading-tight">{t.description?.slice(0,100)}…</div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ── Privacy Budget Meter ─────────────────────────────────────────────────
+    function PrivacyMeter({ epsilon }) {
+      const MAX_EPS = 10;
+      const pct = Math.min(100, (epsilon / MAX_EPS) * 100);
+      const col = pct < 40 ? "#22c55e" : pct < 70 ? "#eab308" : "#ef4444";
+      return (
+        <div>
+          <div className="flex justify-between text-xs text-slate-400 mb-1">
+            <span>ε-budget consumed</span>
+            <span style={{color:col}} className="font-bold">ε = {epsilon.toFixed(3)}</span>
+          </div>
+          <div className="w-full h-3 bg-slate-800 rounded-full overflow-hidden">
+            <div className="h-full rounded-full transition-all duration-500"
+              style={{width:`${pct}%`, background:col}}/>
+          </div>
+          <div className="text-xs text-slate-600 mt-0.5">δ = 1e-5 · Opacus DP</div>
+        </div>
+      );
+    }
+
+    // ── Main App ─────────────────────────────────────────────────────────────
+    function App() {
+      const [connected, setConnected] = useState(false);
+      const [frame, setFrame] = useState(null);
+      const [ewmaHistory, setEwmaHistory] = useState([]);
+      const [epsilon, setEpsilon] = useState(0);
+      const [paused, setPaused] = useState(false);
+      const [error, setError] = useState(null);
+      const wsRef = useRef(null);
+      const pausedRef = useRef(false);
+      pausedRef.current = paused;
+
+      const connect = useCallback(() => {
+        if (wsRef.current) wsRef.current.close();
+        const ws = new WebSocket("ws://localhost:8000/ws/stream");
+        wsRef.current = ws;
+        ws.onopen = () => { setConnected(true); setError(null); };
+        ws.onclose = () => setConnected(false);
+        ws.onerror = () => setError("WebSocket error — is the API running?");
+        ws.onmessage = (e) => {
+          if (pausedRef.current) return;
+          const d = JSON.parse(e.data);
+          if (d.error) { setError(d.error); return; }
+          setFrame(d);
+          setEwmaHistory(h => [...h.slice(-300), d.ewma_score]);
+          if (d.threat?.epsilon) setEpsilon(d.threat.epsilon);
+        };
+      }, []);
+
+      useEffect(() => { connect(); return () => wsRef.current?.close(); }, []);
+
+      const threat = frame?.threat;
+      const sev = frame?.severity ?? 0;
+
+      return (
+        <div className="min-h-screen p-4">
+          {/* Header */}
+          <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
+            <div>
+              <h1 className="text-xl font-bold text-white tracking-widest">CTMAS</h1>
+              <p className="text-xs text-slate-500">Cyber-Physical Threat Monitoring & Analysis System</p>
+            </div>
+            <div className="flex items-center gap-3">
+              {frame && (
+                <div className="text-xs text-slate-400">
+                  T+{frame.timestamp_s}s · window {frame.window_idx}
+                </div>
+              )}
+              <div className={`w-2 h-2 rounded-full ${connected ? "bg-green-500" : "bg-red-500"}`}/>
+              <span className="text-xs text-slate-400">{connected ? "LIVE" : "DISCONNECTED"}</span>
+              <button onClick={() => setPaused(p=>!p)}
+                className="text-xs px-3 py-1 rounded border border-slate-600 text-slate-300 hover:bg-slate-800">
+                {paused ? "Resume" : "Pause"}
+              </button>
+              <button onClick={connect}
+                className="text-xs px-3 py-1 rounded border border-slate-600 text-slate-300 hover:bg-slate-800">
+                Reconnect
+              </button>
+            </div>
+          </div>
+
+          {error && (
+            <div className="mb-4 p-3 bg-red-900/30 border border-red-700 rounded text-red-300 text-sm">
+              {error} — Start the API: <code className="bg-black/40 px-1">uvicorn api.main:app --port 8000</code>
+            </div>
+          )}
+
+          {/* Attack state bar */}
+          {threat && (
+            <div className={`mb-4 p-3 rounded border ${severityGlow(sev)} transition-all duration-300`}
+              style={{borderColor: severityColor(sev), background:"#0f172a"}}>
+              <AttackStateBar
+                state={threat.state}
+                stage={threat.stage}
+                impactProb={threat.impact_probability}
+                minutesToImpact={threat.minutes_to_impact}
+              />
+              <p className="text-xs text-slate-300 mt-2">{threat.description}</p>
+            </div>
+          )}
+
+          {/* Plant topology + per-node errors */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <div className="bg-slate-900 rounded-lg p-3 border border-slate-800">
+              <h2 className="text-xs text-slate-500 uppercase tracking-widest mb-2">Plant Topology</h2>
+              <PlantGraph
+                nodeErrors={frame?.node_errors}
+                nodeAnomaly={frame?.node_anomaly}
+                threshold={0.001}
+              />
+              {frame?.anomaly_nodes?.length > 0 && (
+                <div className="mt-2 text-xs">
+                  <span className="text-slate-500">Anomalous nodes: </span>
+                  {frame.anomaly_nodes.map(n => (
+                    <span key={n} className="mr-2 text-red-400 font-bold">{n}</span>
+                  ))}
+                  <span className="ml-2 px-2 py-0.5 rounded text-xs font-bold"
+                    style={{background: severityColor(sev)+"22", color: severityColor(sev), border:`1px solid ${severityColor(sev)}`}}>
+                    {frame?.anomaly_type}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-900 rounded-lg p-3 border border-slate-800">
+              <h2 className="text-xs text-slate-500 uppercase tracking-widest mb-2">Per-Stage Reconstruction Error</h2>
+              <NodeErrorBars
+                nodeErrors={frame?.node_errors}
+                nodeThreshold={null}
+              />
+            </div>
+          </div>
+
+          {/* EWMA + MITRE */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+            <div className="bg-slate-900 rounded-lg p-3 border border-slate-800">
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-xs text-slate-500 uppercase tracking-widest">EWMA Global Score</h2>
+                {frame?.early_warning && (
+                  <span className="text-xs text-yellow-400 pulse font-bold">⚠ EARLY WARNING</span>
+                )}
+              </div>
+              <EwmaChart history={ewmaHistory} threshold={null}/>
+              {frame && (
+                <div className="text-xs text-slate-400 mt-1">
+                  Current: <span className="text-sky-400 font-bold">{frame.ewma_score.toFixed(6)}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-900 rounded-lg p-3 border border-slate-800">
+              <h2 className="text-xs text-slate-500 uppercase tracking-widest mb-2">
+                MITRE ATT&CK for ICS
+              </h2>
+              <MitreTechniques techniques={threat?.techniques}/>
+            </div>
+          </div>
+
+          {/* Privacy budget */}
+          <div className="bg-slate-900 rounded-lg p-3 border border-slate-800">
+            <PrivacyMeter epsilon={epsilon || 0}/>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
