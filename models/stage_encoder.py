@@ -12,7 +12,7 @@ class StageEncoder(nn.Module):
     No LSTM/GRU — Opacus requires only Conv/Linear layers.
     """
 
-    def __init__(self, n_sensors: int = 13, seq_len: int = 60, hidden_dim: int = 64):
+    def __init__(self, n_sensors: int = 13, seq_len: int = 60, hidden_dim: int = 64, dropout: float = 0.0):
         super().__init__()
         self.conv = nn.Sequential(
             # (batch, n_sensors, seq_len)
@@ -24,6 +24,7 @@ class StageEncoder(nn.Module):
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(10),       # → (batch, 64, 10)  — 60/10=6, MPS-safe
         )
+        self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(64 * 10, hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -31,6 +32,7 @@ class StageEncoder(nn.Module):
         x = x.permute(0, 2, 1)             # → (batch, n_sensors, seq_len)
         x = self.conv(x)                   # → (batch, 64, 10)
         x = x.flatten(1)                   # → (batch, 640)
+        x = self.dropout(x)
         return self.fc(x)                  # → (batch, hidden_dim)
 
 

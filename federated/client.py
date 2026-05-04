@@ -105,8 +105,10 @@ class CTMASClient:
                 out = self.model(x_batch, self.edge_index)
                 _, node_mse = self.model.reconstruction_loss(out)
 
-                # Train on this client's stage only
-                loss = node_mse[self.stage_id]
+                # Use global reconstruction loss across all stages — each client
+                # owns one stage but the shared encoder/decoder must reconstruct
+                # every stage well for the anomaly detector to work.
+                loss = node_mse.mean()
 
                 # FedProx proximal term: keep local weights close to global
                 prox = sum(

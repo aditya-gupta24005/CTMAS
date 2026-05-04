@@ -48,13 +48,14 @@ class SpatioTemporalGNNAutoencoder(nn.Module):
         hidden_dim: int = 64,
         latent_dim: int = 32,
         gnn_layers: int = 2,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
         # Shared encoder/decoder CNN for all stages (padded to 13 sensors)
-        self.stage_encoder = StageEncoder(MAX_SENSORS, SEQ_LEN, hidden_dim)
+        self.stage_encoder = StageEncoder(MAX_SENSORS, SEQ_LEN, hidden_dim, dropout=dropout)
         self.stage_decoder = StageDecoder(MAX_SENSORS, SEQ_LEN, hidden_dim)
 
         # GNN encoder layers
@@ -180,12 +181,22 @@ def _split_to_stages(x: torch.Tensor) -> torch.Tensor:
 
 
 def _mask_padded_node_mse(x_in: torch.Tensor, x_out: torch.Tensor) -> torch.Tensor:
-    """MSE only on real (non-padded) sensors per stage."""
+    """MSE only on real (non-padded) sensors per stage. Returns (N_STAGES,) averaged over batch."""
     counts = STAGE_SENSOR_COUNTS
     node_mse = torch.zeros(N_STAGES, device=x_in.device)
     for i, c in enumerate(counts):
         diff = x_in[:, i, :, :c] - x_out[:, i, :, :c]
         node_mse[i] = (diff ** 2).mean()
+    return node_mse
+
+
+def _per_sample_masked_node_mse(x_in: torch.Tensor, x_out: torch.Tensor) -> torch.Tensor:
+    """Per-sample, per-node MSE on real sensors only. Returns (B, N_STAGES)."""
+    B = x_in.shape[0]
+    node_mse = torch.zeros(B, N_STAGES, device=x_in.device)
+    for i, c in enumerate(STAGE_SENSOR_COUNTS):
+        diff = x_in[:, i, :, :c] - x_out[:, i, :, :c]  # (B, seq_len, c)
+        node_mse[:, i] = (diff ** 2).mean(dim=(1, 2))
     return node_mse
 
 

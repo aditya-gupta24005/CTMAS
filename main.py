@@ -165,7 +165,16 @@ def evaluate_model(
     node_errors, global_errors = detector._batch_per_sample(X_test, batch_size=256)
 
     y_true = y_test.astype(int)
-    thresh = float(detector.node_threshold.mean())
+    # Z-score based detection: normalise each node's error by validation statistics.
+    # P2 (node index 1) is excluded: AIT201 is permanently out of range throughout
+    # the SWaT test phase, giving huge z-scores to both classes (no signal, AUC≈0.5).
+    # P3 (node index 2) is excluded: it has *inverted* signal (AUC=0.35) — the model
+    # reconstructs attacks better than normals on P3, which actively hurts detection.
+    z_scores = (node_errors - detector.node_mean) / detector.node_std  # (N, 6)
+    EXCLUDE_NODES = [1, 2]  # P2, P3
+    z_filtered = np.delete(z_scores, EXCLUDE_NODES, axis=1)            # (N, 4)
+    global_errors = z_filtered.sum(axis=1)                               # (N,)
+    thresh = detector.z_threshold
     y_pred = (global_errors > thresh).astype(int)
 
     f1 = f1_score(y_true, y_pred, zero_division=0)

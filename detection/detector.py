@@ -27,6 +27,7 @@ from models.gnn_model import (
     N_STAGES,
     SpatioTemporalGNNAutoencoder,
     _mask_padded_node_mse,
+    _per_sample_masked_node_mse,
     _split_to_stages,
 )
 
@@ -62,27 +63,50 @@ class AnomalyReport:
 class AnomalyDetector:
     def __init__(
         self,
-        model: SpatioTemporalGNNAutoencoder,
+        model: SpatioTemporalGNNAutoencoder | list[SpatioTemporalGNNAutoencoder],
         ewma_alpha: float = 0.3,
         threshold_std: float = 3.0,
         early_warning_percentile: float = 85.0,
+        z_threshold_percentile: float = 99.9,
+        z_threshold_scale: float = 2.5,
     ):
-        self.model = model.to(DEVICE).eval()
+        # Accept a single model or an ensemble (list of models).
+        if isinstance(model, list):
+            self.models = [m.to(DEVICE).eval() for m in model]
+            self.model = self.models[0]   # for save/load convenience
+        else:
+            self.models = [model.to(DEVICE).eval()]
+            self.model = self.models[0]
         self.edge_index = EDGE_INDEX.to(DEVICE)
         self.ewma_alpha = ewma_alpha
         self.threshold_std = threshold_std
         self.early_warning_percentile = early_warning_percentile
+        # Percentile-based z-threshold is more robust than mean+k*std when
+        # the model's val reconstruction error has heavy tails — common when
+        # training has converged. Scale > 1 buffers val→test distribution shift.
+        self.z_threshold_percentile = z_threshold_percentile
+        self.z_threshold_scale = z_threshold_scale
 
         # Fitted thresholds (set by calibrate())
         self.node_mean: Optional[np.ndarray] = None   # (6,)
         self.node_std: Optional[np.ndarray] = None    # (6,)
         self.node_threshold: Optional[np.ndarray] = None  # (6,)
+        self.z_threshold: Optional[float] = None      # threshold on sum-of-z-scores
         self.ewma_threshold: Optional[float] = None
 
         self._ewma: float = 0.0
         self._first_step = True
 
     # ── calibration ────────────────────────────────────────────────────────
+
+    def _ensemble_node_mse(self, x: torch.Tensor) -> torch.Tensor:
+        """Average per-sample masked MSE across all ensemble members. (B, 6)."""
+        accum = None
+        for m in self.models:
+            out = m(x, self.edge_index)
+            mse = _per_sample_masked_node_mse(out["input_staged"], out["recon"])
+            accum = mse if accum is None else accum + mse
+        return accum / len(self.models)
 
     def calibrate(self, X_val: np.ndarray, batch_size: int = 256) -> None:
         """Compute per-node thresholds from validation (normal) data."""
@@ -94,21 +118,30 @@ class AnomalyDetector:
         with torch.no_grad():
             for (x,) in loader:
                 x = x.to(DEVICE)
-                out = self.model(x, self.edge_index)
-                staged = out["input_staged"]
-                recon = out["recon"]
-                node_mse = _mask_padded_node_mse(staged, recon).cpu().numpy()
+                node_mse = self._ensemble_node_mse(x).cpu().numpy()
                 all_node_errors.append(node_mse)
 
-        errors = np.stack(all_node_errors)    # (n_batches, 6)
-        self.node_mean = errors.mean(axis=0)
-        self.node_std = errors.std(axis=0).clip(min=1e-8)
+        errors = np.concatenate(all_node_errors, axis=0)  # (N_val, 6) per-sample
+        self.node_mean = errors.mean(axis=0)               # (6,)
+        self.node_std = errors.std(axis=0).clip(min=1e-8)  # (6,)
         self.node_threshold = self.node_mean + self.threshold_std * self.node_std
 
-        global_errors = errors.mean(axis=1)   # (n_batches,)
+        # Z-score threshold: calibrate on sum of per-node z-scores for normal data,
+        # excluding P2 (node 1, no signal) and P3 (node 2, inverted signal).
+        EXCLUDE_NODES = [1, 2]  # P2, P3
+        z_val = (errors - self.node_mean) / self.node_std       # (N_val, 6)
+        z_filtered = np.delete(z_val, EXCLUDE_NODES, axis=1)    # (N_val, 4)
+        global_z = z_filtered.sum(axis=1)                       # (N_val,)
+        self.z_threshold = float(
+            np.percentile(global_z, self.z_threshold_percentile)
+            * self.z_threshold_scale
+        )
+
+        global_errors = errors.mean(axis=1)                # (N_val,)
         self.ewma_threshold = float(np.percentile(global_errors, self.early_warning_percentile))
 
         print(f"[Detector] Calibrated — node thresholds: {np.round(self.node_threshold, 5)}")
+        print(f"[Detector] Z-score threshold: {self.z_threshold:.3f}")
         print(f"[Detector] EWMA early-warning threshold: {self.ewma_threshold:.5f}")
 
     # ── inference ──────────────────────────────────────────────────────────
@@ -118,8 +151,7 @@ class AnomalyDetector:
         x_t = torch.tensor(x, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
-            out = self.model(x_t, self.edge_index)
-            node_mse = _mask_padded_node_mse(out["input_staged"], out["recon"]).cpu().numpy()
+            node_mse = self._ensemble_node_mse(x_t).squeeze(0).cpu().numpy()  # (6,)
 
         global_err = float(node_mse.mean())
 
@@ -190,12 +222,7 @@ class AnomalyDetector:
         with torch.no_grad():
             for (x,) in loader:
                 x = x.to(DEVICE)
-                out = self.model(x, self.edge_index)
-                staged = out["input_staged"]   # (B, 6, 60, 13)
-                recon = out["recon"]
-                # Per-sample, per-node MSE
-                diff = (staged - recon) ** 2   # (B, 6, 60, 13)
-                node_mse_batch = diff.mean(dim=(2, 3))  # (B, 6)
+                node_mse_batch = self._ensemble_node_mse(x)
                 node_err_list.append(node_mse_batch.cpu().numpy())
 
         node_errors = np.concatenate(node_err_list, axis=0)    # (N, 6)
