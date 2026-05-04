@@ -28,7 +28,11 @@ from detection.detector import AnomalyDetector
 from intelligence.threat_mapper import ThreatFSM
 from models.gnn_model import SpatioTemporalGNNAutoencoder
 
-app = FastAPI(title="CTMAS", version="3.0")
+app = FastAPI(
+    title="CTMAS — Proactive Threat Modeling for Intelligent Cyber-Physical Systems",
+    description="Federated and Privacy-Aware AI for distributed ICS anomaly detection and threat intelligence.",
+    version="3.0",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -455,7 +459,7 @@ async def _stream_xgboost(websocket: WebSocket, artifacts: dict[str, Any]) -> No
                 "z_threshold": threshold,
                 "predicted_attack": predicted,
                 "early_warning": bool(score >= threshold * 0.6),
-                "anomaly_type": "XGBoostAlarm" if predicted else "ElevatedRisk" if severity > 0 else "None",
+                "anomaly_type": "Isolated" if predicted else "EarlyWarning" if severity > 0 else "None",
                 "anomaly_nodes": anomaly_nodes,
                 "severity": severity,
                 "ground_truth_attack": ground_truth,

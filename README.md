@@ -1,98 +1,144 @@
-# CTMAS — Proactive Threat Modeling for Intelligent Cyber-Physical Systems
+# Proactive Threat Modeling for Intelligent Cyber–Physical Systems Using Federated and Privacy-Aware AI
 
-Supervised anomaly detection and threat intelligence for Industrial Control Systems (ICS), applied to the **SWaT (Secure Water Treatment)** dataset from iTrust, Singapore.
+Real-time cyberattack detection and collaborative threat intelligence for Industrial Control Systems (ICS), applied to the **SWaT (Secure Water Treatment)** dataset — 1.44 M sensor readings across a 6-stage water treatment plant.
 
-**Primary model: XGBoost** (F1=0.827, AUC-ROC=0.985). A Spatio-Temporal GNN autoencoder is also implemented for research comparison.
+**Key contributions:** Spatio-Temporal GNN trained via Federated Learning (FedProx + Byzantine-robust aggregation + (ε,δ)-DP), two-layer anomaly detection (per-node MSE + EWMA early warning), and a dynamic MITRE ATT&CK–mapped FSM for collaborative threat intelligence.
 
 ---
 
-## What This Project Does
+## What This System Does
 
-CTMAS detects cyberattacks on water-treatment plant sensors in real time. It does this by:
+Cyber-physical systems like water treatment plants span multiple distributed sub-systems, each with its own sensors and control logic. Centralising all sensor data for a monolithic classifier raises serious privacy and operational concerns — a plant operator at Stage P3 should not expose raw readings to a remote server.
 
-1. **Classifying 60-second sensor windows as normal or attack** — an XGBoost classifier is trained on statistical features extracted from sliding windows of all 51 sensors. It handles the 96/4 class imbalance via `scale_pos_weight` and a hysteresis threshold to reduce false alarms.
-2. **Escalating from anomaly → campaign** — a Finite State Machine classifies ongoing anomalies as RECON → INTRUSION → IMPACT and maps them to MITRE ATT&CK for ICS techniques.
-3. **Streaming results to a live dashboard** — a FastAPI WebSocket server replays detections window-by-window, with per-stage scores and FSM state visualised in the browser.
-4. **GNN research track (secondary)** — a Spatio-Temporal Graph Neural Network autoencoder also exists for comparison, trained privately via Federated Learning (FedProx + Byzantine-robust aggregation + Opacus differential privacy).
+CTMAS addresses this with:
+
+1. **Federated Spatio-Temporal Anomaly Detection** — six clients (one per plant stage) each train the shared GNN autoencoder on their local sensor windows. No raw sensor data leaves the stage. The server aggregates only model updates.
+2. **Privacy-Preserving Gradient Updates** — each client applies manual DP-SGD (gradient clipping + Gaussian noise) before sending updates. The server tracks the accumulated (ε, δ)-DP privacy budget across rounds.
+3. **Byzantine-Robust Model Aggregation** — a cosine-similarity filter detects and down-weights updates from any client whose gradients diverge from the population median, guarding against poisoned or compromised nodes.
+4. **Collaborative Threat Intelligence** — the globally aggregated model learns cross-stage attack propagation patterns. A Finite State Machine (NORMAL→RECON→INTRUSION→IMPACT) maps anomaly signals to MITRE ATT&CK for ICS techniques shared across all nodes.
+5. **Live Monitoring Dashboard** — a FastAPI + WebSocket server streams per-stage anomaly scores, FSM state, and MITRE technique labels to a browser dashboard in real time.
 
 ---
 
 ## Architecture
 
-### Primary Pipeline (XGBoost)
+### Primary Pipeline — Federated GNN
 
 ```
-Data/merged.csv  (1.44M rows, 51 sensors, 1-second intervals)
+Data/processed/X_train.npy  (1-second sensor windows, split by stage)
         │
-        ▼
- baseline_supervised_from_merged.py
-        │  MinMaxScaler (fit on normal rows only)
-        │  sliding windows: size=60s, stride=10s
-        │  feature extraction: mean, std, min, max, last,
-        │                       delta, trend, change-rate
-        │                       → 408 features per window
-        ▼
- ┌─────────────────────────────────────────────┐
- │   XGBClassifier                              │
- │   700 trees · max_depth=7 · lr=0.04          │
- │   scale_pos_weight=25.4 (handles 96/4 skew)  │
- │   Threshold: hysteresis (high=0.042, low=0.002)│
- └────────────────┬────────────────────────────┘
-                  │ attack probability per window
+        ▼ per-stage client (no raw data crosses client boundary)
+ ┌─────────────────────────────────────────────────────────────┐
+ │  Federated Training (main.py)                               │
+ │  6 CTMASClient instances (federated/client.py)              │
+ │  ├─ Local loss: stage-node reconstruction MSE               │
+ │  ├─ FedProx proximal term (μ=0.01) — prevents client drift  │
+ │  ├─ DP-SGD: clip(C=1.0) + N(0, σ·C/B) gradient noise       │
+ │  └─ Reports accumulated ε to server each round              │
+ │                  │  model parameters only (no raw data)     │
+ │  FedProxByzantineStrategy (federated/server.py)             │
+ │  ├─ Cosine-similarity Byzantine filter                      │
+ │  └─ Weighted FedAvg on filtered updates                     │
+ └────────────────┬────────────────────────────────────────────┘
+                  │ global model weights
                   ▼
- ┌─────────────────────────────────────────────┐
- │   Threat Intelligence FSM                    │
- │   intelligence/threat_mapper.py              │
- │   States: NORMAL → RECON → INTRUSION → IMPACT│
- │   Maps transitions → MITRE ATT&CK for ICS    │
- └────────────────┬────────────────────────────┘
-                  │ JSON events
+ ┌─────────────────────────────────────────────────────────────┐
+ │  SpatioTemporalGNNAutoencoder (models/gnn_model.py)         │
+ │  Per-stage 1D-CNN → GCNConv × 2 (physical water-flow graph) │
+ │  → bottleneck (latent_dim=32) → GCN decoder → 1D-CNN decoder│
+ │  Physical graph: P1↔P2↔P3↔P4↔P5↔P6, P3→P1, P5→P1          │
+ └────────────────┬────────────────────────────────────────────┘
+                  │ per-node reconstruction error
                   ▼
- ┌─────────────────────────────────────────────┐
- │   FastAPI + WebSocket Server  (api/main.py)  │
- │   GET /health  GET /metadata  WS /ws/stream  │
- └────────────────┬────────────────────────────┘
+ ┌─────────────────────────────────────────────────────────────┐
+ │  Two-Layer Anomaly Detector (detection/detector.py)          │
+ │  Layer 1: per-node MSE vs. calibrated threshold (mean + 3σ)  │
+ │  Layer 2: EWMA early warning on global MSE (catches slow     │
+ │           low-amplitude attacks below per-node thresholds)   │
+ └────────────────┬────────────────────────────────────────────┘
+                  │ AnomalyReport (type, nodes, severity, EWMA)
                   ▼
-        frontend/index.html  (live dashboard)
+ ┌─────────────────────────────────────────────────────────────┐
+ │  Collaborative Threat Intelligence FSM                       │
+ │  (intelligence/threat_mapper.py)                            │
+ │  States: NORMAL → RECON → INTRUSION → IMPACT                │
+ │  Drives: MITRE ATT&CK for ICS dynamic technique mapping     │
+ │  (T0842, T0856, T0855, T0831, T0826, T0827)                 │
+ └────────────────┬────────────────────────────────────────────┘
+                  │ JSON threat assessment events
+                  ▼
+ ┌─────────────────────────────────────────────────────────────┐
+ │  FastAPI + WebSocket Server  (api/main.py)                  │
+ │  GET /health   GET /metadata   WS /ws/stream?model=neural   │
+ └────────────────┬────────────────────────────────────────────┘
+                  ▼
+        frontend/index.html  (live monitoring dashboard)
 ```
 
-### Secondary Pipeline (GNN — research track)
+### Centralized Supervised Baseline (XGBoost)
+
+For comparison against the federated approach:
 
 ```
-Data/processed/X_train.npy  (normal windows only)
-        │
-        ▼
- ┌─────────────────────────────────────────────┐
- │   Spatio-Temporal GNN Autoencoder            │
- │   models/gnn_model.py + models/stage_encoder │
- │   Per-stage 1D-CNN → GCN × 2 → bottleneck   │
- │   Trained via federated/client.py (FedProx + │
- │   Opacus DP + Byzantine-robust aggregation)  │
- └────────────────┬────────────────────────────┘
-                  │ per-stage reconstruction error
-                  ▼
- ┌─────────────────────────────────────────────┐
- │   Two-Layer Anomaly Detector                 │
- │   detection/detector.py                      │
- │   Layer 1: per-node MSE threshold (mean+3σ)  │
- │   Layer 2: EWMA early-warning on global MSE  │
- └─────────────────────────────────────────────┘
+Data/merged.csv  → statistical features (408 per 60-s window) → XGBClassifier
+→ hysteresis threshold → simplified FSM → WS /ws/stream?model=xgboost
 ```
 
-Both pipelines feed the same FSM + API + dashboard. Switch between them via `?model=xgboost` or `?model=neural` on the API endpoints.
+XGBoost trains on the full merged dataset (no privacy constraints) and serves as the upper bound for a centralised, non-privacy-preserving approach. **F1=0.827, AUC-ROC=0.985** on the in-distribution test split.
 
 ---
 
-## Key Design Decisions
+## Privacy and Federated Learning Design
 
-| Decision | Why |
-|---|---|
-| **GNN, not LSTM/GRU** | Opacus (differential privacy) can't wrap recurrent layers; 1D-CNN per stage is Opacus-compatible |
-| **FedProx, not FedAvg** | Heterogeneous stage data distributions — proximal term prevents client drift |
-| **Byzantine-robust aggregation** | Cosine-similarity filter down-weights any client whose gradient diverges from the median, guarding against compromised plant sites |
-| **Differential privacy (ε, δ)-DP** | Per-client Opacus DP-SGD with DP_NOISE_MULTIPLIER=0.3, MAX_GRAD_NORM=1.0, δ=1e-5 |
-| **EWMA early warning** | Catches low-and-slow attacks that stay below per-node thresholds |
-| **FSM over static lookup** | Campaign state (RECON/INTRUSION/IMPACT) evolves dynamically with EWMA trend + cross-node correlation, not a hard-coded sensor-prefix → T-code table |
+| Property | Value | Detail |
+|---|---|---|
+| **DP mechanism** | Gaussian (DP-SGD) | Per-client, per-step: clip + N(0, σ·C/B) noise |
+| **Noise multiplier σ** | 0.3 | `DP_NOISE_MULTIPLIER` in `federated/config.py` |
+| **Clipping norm C** | 1.0 | `DP_MAX_GRAD_NORM` |
+| **δ** | 1e-5 | `DP_DELTA` |
+| **ε accounting** | Simple composition bound | `ε ≈ √(2·steps·ln(1/δ)) / σ`, tracked per round |
+| **Aggregation** | FedProx + Byzantine | Cosine-sim filter, threshold=0.5 |
+| **Data shared** | Model updates only | No raw sensor readings leave any client |
+| **FL rounds** | 10 | 3 local epochs per client per round |
+
+The privacy budget (ε, δ) is logged each round and surfaced via the API `/metadata` endpoint. Each plant stage can independently audit its own ε accumulation.
+
+---
+
+## Threat Intelligence — FSM + MITRE ATT&CK for ICS
+
+The FSM is driven dynamically by the anomaly detector's output — not a static sensor-prefix → T-code lookup table.
+
+| FSM State | Trigger | MITRE Techniques |
+|---|---|---|
+| **NORMAL** | All clear (5 consecutive steps) | — |
+| **RECON** | EWMA early warning fires, no threshold breach | T0842 Network Sniffing · T0856 Spoof Reporting Message |
+| **INTRUSION** | Per-node threshold breach (isolated anomaly) | T0855 Unauthorized Command · T0831 Manipulation of Control |
+| **IMPACT** | Propagating anomaly across multiple nodes | T0826 Loss of Availability · T0827 Loss of Control |
+
+State transitions are guarded by a 5-step cooldown so transient spikes don't cause spurious downgrade. The EWMA trend (10-step window) modulates the impact probability and estimated minutes-to-impact estimates.
+
+---
+
+## Physical Plant Graph (SWaT)
+
+```
+P1 ──► P2 ──► P3 ──► P4 ──► P5 ──► P6
+ ▲            │             │
+ └────────────┘             │   (P3 backwash)
+ └───────────────────────────   (P5 RO reject)
+```
+
+Each graph node = one plant stage = one federated client in training. The GNN propagates anomaly signals across the physical water-flow topology, enabling detection of downstream effects — attacks on P3 manifest as correlated anomalies at P1 (backwash loop) that a per-stage classifier would miss.
+
+| Stage | Process | Sensors | Client ID |
+|---|---|---|---|
+| P1 | Raw water intake + chemical dosing | 5 | 0 |
+| P2 | Chemical dosing control | 11 | 1 |
+| P3 | Sand + UF filtration | 9 | 2 |
+| P4 | UV + dechlorination | 9 | 3 |
+| P5 | Reverse osmosis (RO) membrane | 13 | 4 |
+| P6 | Permeate output | 4 | 5 |
 
 ---
 
@@ -106,9 +152,30 @@ Both pipelines feed the same FSM + API + dashboard. Switch between them via `?mo
 | Attack | 54,621 rows (41 distinct attack scenarios) |
 | Class balance | ~96% normal / 4% attack |
 | Sensors | 51 (flow, level, pressure, conductivity, actuators) |
-| Plant stages | P1 (5 sensors) · P2 (11) · P3 (9) · P4 (9) · P5 (13) · P6 (4) |
 
-The dataset is **not included in this repo** (~427 MB). Ask the project owner for the download link and place it at `Data/merged.csv`.
+The dataset is **not included in this repo** (~427 MB). Place it at `Data/merged.csv`.
+
+**Processed splits** (generated by `Data/Data_Preprocessing.py`):
+
+| File | Shape | Contents |
+|---|---|---|
+| `X_train.npy` | (117898, 60, 51) | Normal windows, stride=10s |
+| `X_val.npy` | (20806, 60, 51) | Validation (normal) |
+| `X_test.npy` | (54562, 60, 51) | Attack-period windows |
+| `y_test.npy` | (54562,) | Ground-truth labels |
+
+---
+
+## Key Design Decisions
+
+| Decision | Why |
+|---|---|
+| **GNN, not LSTM/GRU** | Per-sample gradient clipping (DP-SGD) requires gradient isolation per sample; GCNConv + 1D-CNN supports this, recurrent layers do not |
+| **Manual DP-SGD, not Opacus** | Opacus's functorch engine cannot vmap PyG's `message_passing` (edge_index dependency); manual clip+noise achieves identical Gaussian DP mechanism |
+| **FedProx over FedAvg** | Each stage has a different sensor distribution and anomaly base rate; the proximal term (μ·‖w−w_global‖²) prevents the heterogeneous clients from drifting during local epochs |
+| **Byzantine-robust aggregation** | A compromised plant site could poison the global model; cosine-similarity filtering down-weights divergent updates before aggregation |
+| **EWMA early warning** | Low-and-slow attacks (gradual sensor manipulation) stay below per-node thresholds for many windows; EWMA catches the cumulative drift before a threshold breach |
+| **Dynamic FSM, not static lookup** | Attack campaigns evolve; the FSM state is driven by EWMA trend + cross-node correlation pattern, giving a time-aware threat assessment rather than a fixed sensor-name → T-code table |
 
 ---
 
@@ -126,9 +193,9 @@ CTMAS/
 │   └── stage_encoder.py        ← per-stage 1D-CNN encoder/decoder
 │
 ├── federated/
-│   ├── client.py               ← FedProx + Opacus DP client
-│   ├── server.py               ← Byzantine-robust aggregation
-│   └── config.py               ← all FL hyperparameters
+│   ├── client.py               ← FedProx + DP-SGD per-stage client
+│   ├── server.py               ← Byzantine-robust FedProx aggregation server
+│   └── config.py               ← all FL + DP hyperparameters
 │
 ├── detection/
 │   └── detector.py             ← two-layer anomaly detector + AnomalyReport
@@ -140,128 +207,70 @@ CTMAS/
 │   └── main.py                 ← FastAPI WebSocket server
 │
 ├── frontend/
-│   └── index.html              ← live replay dashboard
+│   └── index.html              ← live monitoring dashboard
 │
 ├── main.py                     ← federated training entry point
-├── train_centralized.py        ← single-machine training (no FL)
+├── train_centralized.py        ← single-machine GNN training (no FL)
 ├── train_ensemble.py           ← denoising-AE ensemble training
 ├── eval_ensemble.py            ← ensemble evaluation
 ├── offline_eval.py             ← full metric report on saved model
 │
 ├── baseline_isolation_forest.py          ← unsupervised baseline
-├── baseline_supervised_classifier.py     ← supervised baselines
-├── baseline_supervised_from_merged.py    ← XGBoost / RF / LightGBM on merged.csv
+├── baseline_supervised_classifier.py     ← supervised baseline (processed splits)
+├── baseline_supervised_from_merged.py    ← centralised XGBoost/RF/LightGBM
 │
 ├── SETUP.md                    ← full environment setup guide
 ├── requirements.txt
-└── ctmas_model.pt              ← saved trained model weights
+└── ctmas_model.pt              ← saved federated model weights
 ```
 
 ---
 
 ## Quick Start
 
-See **SETUP.md** for full environment setup. The short version:
+See **SETUP.md** for full environment setup.
 
 ```bash
 # 1. Create and activate virtual environment
 python3.11 -m venv .venv && source .venv/bin/activate
 
-# 2. Install dependencies (no GPU needed for XGBoost)
+# 2. Install dependencies
 pip install -r requirements.txt
 
 # 3. Place merged.csv at Data/merged.csv, then preprocess
 cd Data && python Data_Preprocessing.py && cd ..
 
-# 4. Train and evaluate the XGBoost model
-python baseline_supervised_from_merged.py --model xgboost
+# 4. Federated training (primary system)
+python main.py --rounds 10        # trains 6 clients with FedProx + DP-SGD
+python offline_eval.py            # full metric report on ctmas_model.pt
 
 # 5. Run the API + open the dashboard
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 # → open frontend/index.html in a browser
-# → dashboard defaults to XGBoost (?model=xgboost)
+# → dashboard connects to the federated GNN model by default (?model=neural)
 ```
 
-**GNN track only** — requires GPU + extra setup (see SETUP.md):
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-python main.py --rounds 10   # federated training
-python offline_eval.py       # evaluate ctmas_model.pt
-```
-
----
-
-## Model Scripts
-
-### Primary — XGBoost
-
-| Script | What it does |
-|---|---|
-| `baseline_supervised_from_merged.py` | **Main script.** Trains XGBoost (or RF/LightGBM) directly on `Data/merged.csv`. Saves artifacts to `artifacts/supervised_from_merged/xgboost/` for the dashboard. |
-| `baseline_supervised_classifier.py` | Alternative: trains on `Data/processed/` splits instead of merged.csv |
-| `baseline_isolation_forest.py` | Unsupervised baseline (no labels needed) |
-
-Run:
+**Centralized baseline only** (no GPU required):
 ```bash
 python baseline_supervised_from_merged.py --model xgboost
-# Other models: --model random_forest | hist_gb | lightgbm
+# → saves artifacts for dashboard comparison: ?model=xgboost
 ```
 
-### Secondary — GNN (research track, requires GPU)
-
-| Script | What it does |
-|---|---|
-| `main.py` | Full federated training (FedProx + DP, 6 clients) |
-| `train_centralized.py` | Single-machine GNN training, no FL overhead |
-| `train_ensemble.py` | Trains N denoising-AE members for ensemble |
-| `eval_ensemble.py` | Evaluates saved ensemble members |
-| `offline_eval.py` | Full metric report (F1, AUC-ROC, MTTD, FPR) on `ctmas_model.pt` |
-
 ---
 
-## Results
-
-### XGBoost (primary model)
-
-| Eval set | F1 | AUC-ROC | PR-AUC | FPR |
-|---|---|---|---|---|
-| In-distribution test split | 0.827 | 0.985 | 0.886 | 0.64% |
-| Mixed replay (real attack timeline) | 0.772 | 0.917 | 0.824 | 2.85% |
-| Replay holdout (unseen calibration) | 0.865 | — | — | 0.04% |
-
-Threshold rule: hysteresis (high=0.042, low=0.002) calibrated on the first half of the mixed replay set.
-
----
-
-## GNN / Federated Learning Config (`federated/config.py`)
-
-> Only relevant if using the GNN research track.
+## Federated + DP Configuration (`federated/config.py`)
 
 | Parameter | Value | Meaning |
 |---|---|---|
-| `FL_ROUNDS` | 10 | Number of federated rounds |
-| `LOCAL_EPOCHS` | 3 | Epochs per client per round |
+| `FL_ROUNDS` | 10 | Federated communication rounds |
+| `LOCAL_EPOCHS` | 3 | Local epochs per client per round |
 | `MU` | 0.01 | FedProx proximal penalty |
-| `BYZANTINE_THRESHOLD` | 0.5 | Cosine similarity cutoff for Byzantine filter |
-| `DP_NOISE_MULTIPLIER` | 0.3 | Gaussian noise for differential privacy |
-| `DP_MAX_GRAD_NORM` | 1.0 | Gradient clipping norm |
+| `BYZANTINE_THRESHOLD` | 0.5 | Cosine similarity cutoff |
+| `DP_NOISE_MULTIPLIER` | 0.3 | Gaussian noise σ for DP-SGD |
+| `DP_MAX_GRAD_NORM` | 1.0 | Per-sample gradient clipping norm C |
+| `DP_DELTA` | 1e-5 | Target δ for (ε,δ)-DP |
 | `HIDDEN_DIM` | 64 | GNN encoder width |
-| `LATENT_DIM` | 32 | Bottleneck size |
-
----
-
-## Physical Plant Graph
-
-The 6 plant stages and their water-flow connections (used by the GNN; also informs which sensors are co-located for feature engineering):
-
-```
-P1 ──► P2 ──► P3 ──► P4 ──► P5 ──► P6
- ▲            │             │
- └────────────┘             │   (P3 backwash)
- └───────────────────────────   (P5 RO reject)
-```
-
-Each node = one plant stage. Node features = that stage's sensors padded to 13 (max across all stages).
+| `LATENT_DIM` | 32 | Bottleneck embedding size |
 
 ---
 
@@ -270,7 +279,23 @@ Each node = one plant stage. Node features = that stage's sensors padded to 13 (
 | Endpoint | Description |
 |---|---|
 | `GET /health?model=neural\|xgboost` | Liveness check + model metadata |
-| `GET /metadata?model=neural\|xgboost` | Full model config, thresholds, stage map |
-| `WS /ws/stream?model=neural\|xgboost` | Streams window-by-window replay with anomaly scores |
+| `GET /metadata?model=neural\|xgboost` | Full config, thresholds, stage map |
+| `WS /ws/stream?model=neural` | Federated GNN stream (default) |
+| `WS /ws/stream?model=xgboost` | Centralised baseline stream (comparison) |
 
-The dashboard (`frontend/index.html`) connects to the WebSocket and visualises per-stage reconstruction errors, FSM state, and MITRE technique labels in real time.
+The dashboard visualises per-stage reconstruction errors, FSM campaign state, MITRE technique labels, running F1, and ground-truth labels in real time.
+
+---
+
+## Comparison: Federated vs. Centralised
+
+| Property | Federated GNN (primary) | Centralised XGBoost (baseline) |
+|---|---|---|
+| Raw data shared | No — gradients only | Yes — full merged.csv |
+| Privacy guarantee | (ε, δ)-DP per client | None |
+| Poisoning resistance | Byzantine cosine filter | None |
+| Topology awareness | Physical plant graph (GCN) | Feature engineering only |
+| Early warning | EWMA + cross-node propagation | EWMA on score only |
+| Threat intelligence | Full FSM + MITRE ATT&CK | Simplified score-ratio FSM |
+| F1 (test split) | see `offline_eval.py` output | 0.827 |
+| AUC-ROC | see `offline_eval.py` output | 0.985 |
